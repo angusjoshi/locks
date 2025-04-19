@@ -20,7 +20,7 @@ const SpinLockMtx = struct {
     }
 };
 
-const FutexMtx = struct {
+const FutexMutex = struct {
     const Self = @This();
     const Futex = std.Thread.Futex;
 
@@ -28,9 +28,31 @@ const FutexMtx = struct {
     flag: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     fn lock(self: *Self) void {
-        while (self.flag.cmpxchgStrong(0, 1, AtomicOrder.acq_rel, AtomicOrder.acquire) != null) {
-            Futex.wait(&self.flag, 0);
+        while (self.flag.cmpxchgWeak(0, 1, AtomicOrder.acq_rel, AtomicOrder.monotonic) != null) {
+            // flag can only hold the value 0 or 1. if it was not 0, then it was 1.
+            // note that using cpmxchgWeak is fine here, because Futex.wait will not block
+            // if the flag is not read as 1.
+            Futex.wait(&self.flag, 1);
         }
+    }
+
+    fn unlock(self: *Self) void {
+        self.flag.store(0, AtomicOrder.release);
+        Futex.wake(&self.flag, 1);
+    }
+};
+
+const SpinnyFutexMutex = struct {
+    const Self = @This();
+    const Futex = std.Thread.Futex;
+
+    // 0 means unlocked, 1 means locked.
+    flag: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    fn lock(self: *Self) void {
+        var i: u8 = 0;
+
+        while (i < 10 and self.flag.cmpxchgWeak(0, 1, AtomicOrder.acq_rel, AtomicOrder.monotonic) != null) : (i += 1) {}
     }
 
     fn unlock(self: *Self) void {
@@ -43,7 +65,7 @@ const Lock = union(enum) {
     const Self = @This();
 
     spin: SpinLockMtx,
-    ftx: FutexMtx,
+    ftx: FutexMutex,
 
     fn lock(self: *Self) void {
         switch (self.*) {
@@ -96,7 +118,7 @@ test "spinlock multithreaded increment" {
 test "ftxlock multithreaded increment" {
     var go = std.atomic.Value(bool).init(false);
     var toIncrement: u64 = 0;
-    const futexlock = FutexMtx{};
+    const futexlock = FutexMutex{};
     var mtx = Lock{ .ftx = futexlock };
 
     var threads: [1000]std.Thread = undefined;
@@ -110,7 +132,7 @@ test "ftxlock multithreaded increment" {
         thread.join();
     }
     const endTime = std.time.nanoTimestamp();
-    std.debug.print("ftxlock difference was {}\n", .{endTime - startTime});
+    std.debug.print("ftexlock difference was {}\n", .{endTime - startTime});
 
     try std.testing.expectEqual(1000 * 1000, toIncrement);
 }
