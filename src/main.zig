@@ -42,22 +42,81 @@ const FutexMutex = struct {
     }
 };
 
-const SpinnyFutexMutex = struct {
+const MutexSemaphore = struct {
+    const Self = @This();
+
+    mtx: std.Thread.Mutex = std.Thread.Mutex{},
+    cond: std.Thread.Condition = std.Thread.Condition{},
+    permits: u32 = undefined,
+
+    fn init(permits: u32) Self {
+        return Self{ .permits = permits };
+    }
+
+    fn acquire(self: *Self) void {
+        self.mtx.lock();
+        defer self.mtx.unlock();
+
+        while (self.permits == 0) {
+            self.cond.wait(&self.mtx);
+        }
+
+        self.permits -= 1;
+    }
+
+    fn release(self: *Self) void {
+        self.mtx.lock();
+        const permitsRead = self.permits;
+        self.permits += 1;
+        self.mtx.unlock();
+
+        // not sure if this is correct.
+        if (permitsRead == 0) {
+            self.cond.signal();
+        }
+    }
+};
+
+// non-blocking on the there are permits left path (but still busy waits for the cmpxchg),
+// but blocks if it reads that there are no permits left.
+const FutexSemaphore = struct {
     const Self = @This();
     const Futex = std.Thread.Futex;
 
-    // 0 means unlocked, 1 means locked.
-    flag: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    permits: std.atomic.Value(u32),
 
-    fn lock(self: *Self) void {
-        var i: u8 = 0;
-
-        while (i < 10 and self.flag.cmpxchgWeak(0, 1, AtomicOrder.acq_rel, AtomicOrder.monotonic) != null) : (i += 1) {}
+    fn init(permits: u32) Self {
+        return Self{ .permits = std.atomic.Value(u32).init(permits) };
     }
 
-    fn unlock(self: *Self) void {
-        self.flag.store(0, AtomicOrder.release);
-        Futex.wake(&self.flag, 1);
+    fn acquire(self: *Self) void {
+        var p: u32 = self.permits.load(.monotonic);
+        while (true) {
+            while (p == 0) : (p = self.permits.load(.monotonic)) {
+                Futex.wait(&self.permits, 0);
+            }
+
+            while (true) {
+                p = self.permits.cmpxchgWeak(p, p - 1, .acq_rel, .monotonic);
+                if (p == null) {
+                    // great success
+                    return;
+                }
+                if (p == 0) {
+                    // some other thread set it to zero between the load and cmpxchg,
+                    // so go back to waiting for it to be non-zero again.
+                    break;
+                }
+            }
+        }
+    }
+
+    fn release(self: *Self) void {
+        const prevPermits = self.permits.fetchAdd(1, .release);
+
+        if (prevPermits == 0) {
+            Futex.wake(&self.permits, 1);
+        }
     }
 };
 
