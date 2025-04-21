@@ -112,7 +112,8 @@ const FutexSemaphore = struct {
     }
 
     fn release(self: *Self) void {
-        const prevPermits = self.permits.fetchAdd(1, .release);
+        // TODO not sure what to memory ordering should be here.
+        const prevPermits = self.permits.fetchAdd(1, .acq_rel);
 
         if (prevPermits == 0) {
             Futex.wake(&self.permits, 1);
