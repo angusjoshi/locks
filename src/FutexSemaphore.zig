@@ -53,19 +53,15 @@ test "basic correctness" {
         fn work(self: *@This()) !void {
             self.reset.wait();
 
-            // it's somewhat important to not use acquire/release ordering on the loads/stores to
-            // threadsInCriticalSection so as not to give extra synchronization beyond what the semaphore offers.
-            // we do however get guarantees, since the fetchAdd load/store are on the same atomic, that
-            // the effect of the fetchSub is always observed to happen after the effect of the fetchAdd.
             for (0..1_000) |_| {
                 self.semaphore.acquire();
                 const before = self.threadsInCriticalSection.fetchAdd(1, .monotonic);
                 std.time.sleep(self.getRand(1 * std.time.ns_per_ms));
-                self.semaphore.release();
                 const after = self.threadsInCriticalSection.fetchSub(1, .monotonic);
+                self.semaphore.release();
 
-                try std.testing.expect(before >= 0 and before <= 41);
-                try std.testing.expect(after >= 1 and after <= 42);
+                std.debug.assert(before >= 0 and before <= 41);
+                std.debug.assert(after >= 1 and after <= 42);
             }
         }
     };
