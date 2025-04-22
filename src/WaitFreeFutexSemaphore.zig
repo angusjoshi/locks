@@ -1,51 +1,40 @@
-// non-blocking on the there are permits left path (but still busy waits for the cmpxchg),
-// but blocks if it reads that there are no permits left.
-const FutexSemaphore = @This();
+const WaitFreeFutexSemaphore = @This();
 const Futex = std.Thread.Futex;
 
-permits: std.atomic.Value(u32),
+permits: std.atomic.Value(i32),
 
-fn init(permits: u32) FutexSemaphore {
-    return .{ .permits = std.atomic.Value(u32).init(permits) };
+fn init(permits: i32) WaitFreeFutexSemaphore {
+    return .{ .permits = std.atomic.Value(i32).init(permits) };
 }
 
-fn acquire(self: *FutexSemaphore) void {
-    var p = self.permits.load(.monotonic);
+fn acquire(self: *WaitFreeFutexSemaphore) void {
     while (true) {
-        while (p == 0) : (p = self.permits.load(.monotonic)) {
-            Futex.wait(&self.permits, 0);
+        const was = self.permits.fetchSub(1, .acq_rel);
+
+        if (was <= 0) {
+            // oops. there actually weren't any permits left.
+            _ = self.permits.fetchAdd(1, .monotonic);
+            std.atomic.spinLoopHint();
+            continue;
         }
 
-        while (true) {
-            const result = self.permits.cmpxchgWeak(p, p - 1, .acq_rel, .monotonic);
-            if (result == null) {
-                // great success
-                return;
-            }
-            if (result == 0) {
-                // some other thread set it to zero between the load and cmpxchg,
-                // so go back to waiting for it to be non-zero again.
-                break;
-            }
-
-            p = result.?;
-        }
+        return;
     }
 }
 
-fn release(self: *FutexSemaphore) void {
-    // TODO not sure what to memory ordering should be here.
+fn release(self: *WaitFreeFutexSemaphore) void {
     _ = self.permits.fetchAdd(1, .acq_rel);
+}
 
-    // TODO can we skip this syscall in some scenarios? just checking if fetchAdd loaded 0 is not sufficient.
-    Futex.wake(&self.permits, 1);
+test "ref" {
+    std.testing.refAllDecls(WaitFreeFutexSemaphore);
 }
 
 test "basic correctness" {
     const Context = struct {
         reset: std.Thread.ResetEvent = .{},
         threadsInCriticalSection: std.atomic.Value(i32) = std.atomic.Value(i32).init(0),
-        semaphore: FutexSemaphore = FutexSemaphore.init(42),
+        semaphore: WaitFreeFutexSemaphore = WaitFreeFutexSemaphore.init(42),
         rand: std.Random,
 
         fn getRand(self: *@This(), atMost: u32) u32 {
@@ -92,7 +81,7 @@ test "basic correctness" {
 
 test "other correctness" {
     const Context = struct {
-        semaphore: FutexSemaphore = FutexSemaphore.init(5),
+        semaphore: WaitFreeFutexSemaphore = WaitFreeFutexSemaphore.init(5),
         reset: std.Thread.ResetEvent = .{},
         flags: [10]bool = undefined,
 
@@ -131,5 +120,4 @@ test "other correctness" {
         threads[i].join();
     }
 }
-
 const std = @import("std");
